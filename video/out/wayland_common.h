@@ -203,6 +203,29 @@ struct vo_wayland_state {
     char *session_file;
     struct xdg_session_v1 *xdg_session;
     struct xdg_toplevel_session_v1 *xdg_toplevel_session;
+
+    /* Stuff for remote display */
+    int remote_display_fd;
+    char *remote_display_name;
+    char *remote_output_name;
+    char *remote_seat_name;
+    struct wl_display *remote_display;
+    struct wl_registry *remote_registry;
+    struct wl_list remote_output_list;
+    struct wl_list remote_seat_list;
+    struct vo_wayland_remote_output *remote_output;
+    struct vo_wayland_remote_seat *remote_seat;
+    struct zwp_virtual_keyboard_manager_v1 *remote_virtual_keyboard_manager;
+    struct zwp_virtual_keyboard_v1 *remote_virtual_keyboard;
+    struct zwlr_virtual_pointer_manager_v1 *remote_virtual_pointer_manager;
+    struct zwlr_virtual_pointer_v1 *remote_virtual_pointer;
+    struct xkb_keymap *remote_host_keymap;
+    bool remote_ever_sent_keymap;
+    bool remote_frame_button_axis;
+
+    /* Stuff for input forwarding that isn't part of the remote display */
+    struct zwp_pointer_constraints_v1 *pointer_constraints;
+    struct zwp_relative_pointer_manager_v1 *relative_pointer_manager;
 };
 
 bool vo_wayland_check_visible(struct vo *vo);

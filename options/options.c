@@ -221,6 +221,12 @@ static const m_option_t mp_vo_opt_list[] = {
         M_RANGE(0, INT_MAX)},
     {"wayland-present", OPT_BOOL(wl_present)},
     {"wayland-session", OPT_STRING(wayland_session)},
+    {"wayland-remote-input-forwarding", OPT_BOOL(wl_remote_input_forwarding)},
+    {"wayland-remote-display-name", OPT_STRING(wl_remote_display_name)},
+    {"wayland-remote-output-name", OPT_STRING(wl_remote_output_name)},
+    {"wayland-remote-seat-name", OPT_STRING(wl_remote_seat_name)},
+    {"wayland-remote-force-grab-cursor", OPT_BOOL(wl_remote_force_grab_cursor)},
+    {"wayland-remote-swaysock", OPT_STRING(wl_remote_swaysock)},
 #endif
 #if HAVE_WIN32_DESKTOP
 // For old MinGW-w64 compatibility
@@ -288,6 +294,10 @@ const struct m_sub_options vo_sub_opts = {
         .wl_edge_pixels_touch = 32,
         .wl_internal_vsync = 1,
         .wl_present = true,
+        .wl_remote_display_name = NULL,
+        .wl_remote_output_name = NULL,
+        .wl_remote_seat_name = NULL,
+        .wl_remote_swaysock = NULL,
         .mmcss_profile = "Playback",
         .ontop_level = -1,
         .timing_offset = 0.050,

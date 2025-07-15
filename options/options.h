@@ -44,6 +44,12 @@ typedef struct mp_vo_opts {
     int wl_edge_pixels_pointer;
     int wl_edge_pixels_touch;
     bool wl_present;
+    bool wl_remote_input_forwarding;
+    char *wl_remote_display_name;
+    char *wl_remote_output_name;
+    char *wl_remote_seat_name;
+    bool wl_remote_force_grab_cursor;
+    char *wl_remote_swaysock;
 
     float panscan;
     float zoom;

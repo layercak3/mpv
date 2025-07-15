@@ -206,6 +206,7 @@ struct input_opts {
     bool vo_key_input;
     bool test;
     bool allow_win_drag;
+    bool downgrade_no_binding;
     bool preprocess_wheel;
     bool touch_emulate_mouse;
     bool tablet_emulate_mouse;
@@ -237,6 +238,7 @@ const struct m_sub_options input_config = {
         {"input-gamepad", OPT_BOOL(use_gamepad)},
 #endif
         {"window-dragging", OPT_BOOL(allow_win_drag)},
+        {"input-downgrade-no-key-binding", OPT_BOOL(downgrade_no_binding)},
         {0}
     },
     .size = sizeof(struct input_opts),
@@ -517,7 +519,7 @@ static mp_cmd_t *get_cmd_from_keys(struct input_ctx *ictx, bstr force_section,
     if (!cmd) {
         if (code == MP_KEY_CLOSE_WIN)
             return mp_input_parse_cmd_strv(ictx->log, (const char*[]){"quit", 0});
-        int msgl = MSGL_WARN;
+        int msgl = ictx->opts->downgrade_no_binding ? MSGL_TRACE : MSGL_WARN;
         if (MP_KEY_IS_MOUSE_MOVE(code))
             msgl = MSGL_TRACE;
         char *key_buf = mp_input_get_key_combo_name(&code, 1);

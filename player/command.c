@@ -3166,6 +3166,13 @@ static int mp_property_mouse_pos(void *ctx, struct m_property *prop,
 {
     MPContext *mpctx = ctx;
 
+    if (action == M_PROPERTY_SET || action == M_PROPERTY_SET_NODE) {
+        struct vo *vo = mpctx->video_out;
+        if (vo)
+            vo_control(vo, VOCTRL_SET_MOUSE_POS, arg);
+        return M_PROPERTY_OK;
+    }
+
     int valid = m_property_read_sub_validate(ctx, prop, action, arg);
     if (valid != M_PROPERTY_VALID)
         return valid;

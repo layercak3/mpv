@@ -4535,6 +4535,9 @@ Input
 ``--input-gamepad=<yes|no>``
     Enable/disable SDL2 Gamepad support. Disabled by default.
 
+``--input-downgrade-no-key-binding=<yes|no>``
+    Downgrade "no key binding found" message to trace. Disabled by default.
+
 ``--input-cursor=<yes|no>``
     Permit mpv to receive pointer events reported by the video output
     driver. Necessary to use the OSC. Support depends on the VO in use.
@@ -6355,6 +6358,60 @@ them.
     Set the wayland session name for window restoration (default: unset).
     Not setting this or setting it to the empty string disables session
     management.
+
+``--wayland-remote-input-forwarding=<yes|no>``
+    Enable input forwarding and related functionality in the wayland vo and
+    accompanying mpvif-plugin C plugin. (default: no)
+
+    This is configurable at runtime.
+
+    This option does not do anything if ``--wayland-remote-display-name`` isn't
+    set.
+
+``--wayland-remote-display-name=<string>``
+    If this is set, a connection will be made to a remote display to allow input
+    forwarding to be enabled. This will be passed to wl_display_connect.
+
+    This option is required on vo init for ``--wayland-remote-input-forwarding``
+    to work, and is not configurable during the runtime of the vo.
+
+    If this is set, you also need to set ``--wayland-remote-output-name`` and
+    ``--wayland-remote-seat-name``.
+
+``--wayland-remote-output-name=<string>``
+    The name of the output on the remote display that the remote compositor will
+    be asked to map the virtual pointer to.
+
+    This option is required on vo init for ``--wayland-remote-input-forwarding``
+    to work, and is not configurable during the runtime of the vo.
+
+    This option does not do anything if ``--wayland-remote-display-name`` isn't
+    set.
+
+``--wayland-remote-seat-name=<string>``
+    The name of the seat on the remote display that the remote compositor will
+    be asked to assign the virtual keyboard and pointer to.
+
+    This option is required on vo init for ``--wayland-remote-input-forwarding``
+    to work, and is not configurable during the runtime of the vo.
+
+    This option does not do anything if ``--wayland-remote-display-name`` isn't
+    set.
+
+``--wayland-remote-force-grab-cursor=<yes|no>``
+    When this is enabled and remote input forwarding is enabled, the pointer
+    will be locked and relative motion requests will be emitted on the virtual
+    pointer instead of absolute motion requests. This allows manually enabling
+    mouselook functionality in 3D applications. (default: no).
+
+    This is configurable at runtime.
+
+``--wayland-remote-swaysock=<string>``
+    If this is set, the C plugin will connect to sway's IPC socket at this
+    location. This is used to support auto cursor placement on patched sway
+    compositors.
+
+    This option is not configurable during the runtime of the C plugin.
 
 ``--spirv-compiler=<compiler>``
     Controls which compiler is used to translate GLSL to SPIR-V. This is

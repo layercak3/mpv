@@ -3147,8 +3147,10 @@ Property list
     available, i.e d3d11-output-mode is not set to ``composition`` or the VO
     does not support it.
 
-``mouse-pos``
-    Read-only - last known mouse position, normalized to OSD dimensions.
+``mouse-pos`` (RW)
+    Last known mouse position, normalized to OSD dimensions.
+
+    Writing to this property tells the current VO to set the mouse position.
 
     Has the following sub-properties (which can be read as ``MPV_FORMAT_NODE``
     or Lua table with ``mp.get_property_native``):

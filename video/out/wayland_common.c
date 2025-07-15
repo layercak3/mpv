@@ -41,6 +41,9 @@
 #include "wayland_common.h"
 #include "win_state.h"
 
+// We need this to parse the mouse pos node from voctrl.
+#include "mpv/client.h"
+
 // Generated from wayland-protocols
 #include "idle-inhibit-unstable-v1.h"
 #include "text-input-unstable-v3.h"
@@ -68,6 +71,12 @@
 #if HAVE_WAYLAND_PROTOCOLS_1_48
 #include "xdg-session-management-v1.h"
 #endif
+
+// Input forwarding and remote compositor use
+#include "virtual-keyboard-unstable-v1.h"
+#include "wlr-virtual-pointer-unstable-v1.h"
+#include "relative-pointer-unstable-v1.h"
+#include "pointer-constraints-unstable-v1.h"
 
 #ifndef CLOCK_MONOTONIC_RAW
 #define CLOCK_MONOTONIC_RAW 4
@@ -223,6 +232,10 @@ struct vo_wayland_seat {
     bool keyboard_entering;
     uint32_t *keyboard_entering_keys;
     int num_keyboard_entering_keys;
+
+    /* Stuff for input forwarding */
+    struct zwp_locked_pointer_v1 *locked_pointer;
+    struct zwp_relative_pointer_v1 *relative_pointer;
 };
 
 struct vo_wayland_tablet {
@@ -307,6 +320,21 @@ struct vo_wayland_preferred_description_info {
     uint32_t icc_size;
 };
 
+struct vo_wayland_remote_output {
+    struct vo_wayland_state *wl;
+    struct wl_output *output;
+    uint32_t id;
+    char *name;
+    struct wl_list link;
+};
+
+struct vo_wayland_remote_seat {
+    struct vo_wayland_state *wl;
+    struct wl_seat *seat;
+    uint32_t id;
+    struct wl_list link;
+};
+
 static bool single_output_spanned(struct vo_wayland_state *wl);
 
 static int check_for_resize(struct vo_wayland_state *wl, int edge_pixels,
@@ -344,6 +372,17 @@ static void destroy_offer(struct vo_wayland_data_offer *o);
 static char *session_file(void *talloc_ctx, const char *session, struct vo *vo);
 static char *read_session_id(void *talloc_ctx, struct vo_wayland_state *wl, const char *path);
 #endif
+static void toggle_force_grab_cursor(struct vo_wayland_state *wl);
+static void remote_toggle_input_forwarding(struct vo_wayland_state *wl);
+static void seat_remove_locked_pointer(struct vo_wayland_seat *s);
+static void seat_remove_relative_pointer(struct vo_wayland_seat *s);
+static void remote_remove_virtual_keyboard(struct vo_wayland_state *wl);
+static void remote_remove_virtual_pointer(struct vo_wayland_state *wl);
+static void remote_remove_output(struct vo_wayland_remote_output *remote_out);
+static void remote_remove_seat(struct vo_wayland_remote_seat *remote_seat);
+static void remote_create_virtual_keyboard(struct vo_wayland_state *wl);
+static void remote_create_virtual_pointer(struct vo_wayland_state *wl);
+static void remote_sync_keymap(struct vo_wayland_state *wl);
 
 /* Wayland listener boilerplate */
 static void pointer_handle_enter(void *data, struct wl_pointer *pointer,
@@ -396,6 +435,10 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
     struct vo_wayland_seat *s = data;
     struct vo_wayland_state *wl = s->wl;
     s->last_serial = serial;
+
+    uint32_t original_button = button;
+    uint32_t original_state = state;
+
     state = state == WL_POINTER_BUTTON_STATE_PRESSED ? MP_KEY_STATE_DOWN
                                                      : MP_KEY_STATE_UP;
 
@@ -441,12 +484,20 @@ static void pointer_handle_button(void *data, struct wl_pointer *wl_pointer,
 
     if (button)
         mp_input_put_key(wl->vo->input_ctx, button | state | s->mpmod);
+
+    wl->remote_frame_button_axis = true;
+
+    if (!wl->remote_virtual_pointer)
+        return;
+
+    zwlr_virtual_pointer_v1_button(wl->remote_virtual_pointer, time, original_button, original_state);
 }
 
 static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
                                 uint32_t time, uint32_t axis, wl_fixed_t value)
 {
     struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
     switch (axis) {
     case WL_POINTER_AXIS_VERTICAL_SCROLL:
         s->axis_value_vertical += wl_fixed_to_double(value);
@@ -455,6 +506,16 @@ static void pointer_handle_axis(void *data, struct wl_pointer *wl_pointer,
         s->axis_value_horizontal += wl_fixed_to_double(value);
         break;
     }
+
+    /* FIXME: this should be associated with the seat, in case of multiseat? */
+    wl->remote_frame_button_axis = true;
+
+    if (!wl->remote_virtual_pointer)
+        return;
+
+    /* winewayland doesn't handle wl_pointer.axis events */
+    int32_t discrete = value < 0 ? -1 : 1;
+    zwlr_virtual_pointer_v1_axis_discrete(wl->remote_virtual_pointer, time, axis, value, discrete);
 }
 
 static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
@@ -490,16 +551,42 @@ static void pointer_handle_frame(void *data, struct wl_pointer *wl_pointer)
     s->axis_value_horizontal = 0;
     s->axis_value120_vertical = 0;
     s->axis_value120_horizontal = 0;
+
+    if (!wl->remote_virtual_pointer) {
+        wl->remote_frame_button_axis = false;
+        return;
+    }
+
+    /* the C plugin will send frame for its motion request, so only send frame
+     * for button/axis */
+    if (wl->remote_frame_button_axis)
+        zwlr_virtual_pointer_v1_frame(wl->remote_virtual_pointer);
+
+    wl->remote_frame_button_axis = false;
 }
 
 static void pointer_handle_axis_source(void *data, struct wl_pointer *wl_pointer,
                                        uint32_t axis_source)
 {
+    struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
+
+    if (!wl->remote_virtual_pointer)
+        return;
+
+    zwlr_virtual_pointer_v1_axis_source(wl->remote_virtual_pointer, axis_source);
 }
 
 static void pointer_handle_axis_stop(void *data, struct wl_pointer *wl_pointer,
                                      uint32_t time, uint32_t axis)
 {
+    struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
+
+    if (!wl->remote_virtual_pointer)
+        return;
+
+    zwlr_virtual_pointer_v1_axis_stop(wl->remote_virtual_pointer, time, axis);
 }
 
 static void pointer_handle_axis_discrete(void *data, struct wl_pointer *wl_pointer,
@@ -1115,6 +1202,9 @@ static void keyboard_handle_keymap(void *data, struct wl_keyboard *wl_keyboard,
         s->xkb_keymap = NULL;
         return;
     }
+
+    wl->remote_host_keymap = s->xkb_keymap;
+    remote_sync_keymap(wl);
 }
 
 static void keyboard_handle_enter(void *data, struct wl_keyboard *wl_keyboard,
@@ -1152,8 +1242,14 @@ static void keyboard_handle_key(void *data, struct wl_keyboard *wl_keyboard,
                                 uint32_t state)
 {
     struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
     s->last_serial = serial;
     handle_key_input(s, key, state, false);
+
+    if (!wl->remote_virtual_keyboard || !wl->remote_ever_sent_keymap)
+        return;
+
+    zwp_virtual_keyboard_v1_key(wl->remote_virtual_keyboard, time, key, state);
 }
 
 static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboard,
@@ -1182,6 +1278,12 @@ static void keyboard_handle_modifiers(void *data, struct wl_keyboard *wl_keyboar
     } else if (s->xkb_state && s->mpkey) {
         mp_input_put_key(wl->vo->input_ctx, s->mpkey | MP_KEY_STATE_DOWN | s->mpmod);
     }
+
+    if (!wl->remote_virtual_keyboard || !wl->remote_ever_sent_keymap)
+        return;
+
+    zwp_virtual_keyboard_v1_modifiers(wl->remote_virtual_keyboard,
+            mods_depressed, mods_latched, mods_locked, group);
 }
 
 static void keyboard_handle_repeat_info(void *data, struct wl_keyboard *wl_keyboard,
@@ -1210,8 +1312,13 @@ static void seat_handle_caps(void *data, struct wl_seat *seat,
     if ((caps & WL_SEAT_CAPABILITY_POINTER) && !s->pointer) {
         s->pointer = wl_seat_get_pointer(seat);
         get_shape_device(s->wl, s);
+        toggle_force_grab_cursor(s->wl);
         wl_pointer_add_listener(s->pointer, &pointer_listener, s);
     } else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && s->pointer) {
+        if (s->locked_pointer)
+            seat_remove_locked_pointer(s);
+        if (s->relative_pointer)
+            seat_remove_relative_pointer(s);
         wl_pointer_destroy(s->pointer);
         s->pointer = NULL;
     }
@@ -2956,6 +3063,16 @@ static void registry_handle_add(void *data, struct wl_registry *reg, uint32_t id
     }
 #endif
 
+    if (!strcmp(interface, zwp_pointer_constraints_v1_interface.name) && found++) {
+        ver = 1;
+        wl->pointer_constraints = wl_registry_bind(reg, id, &zwp_pointer_constraints_v1_interface, ver);
+    }
+
+    if (!strcmp(interface, zwp_relative_pointer_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->relative_pointer_manager = wl_registry_bind(reg, id, &zwp_relative_pointer_manager_v1_interface, ver);
+    }
+
     if (found > 1)
         MP_VERBOSE(wl, "Registered interface %s at version %d\n", interface, ver);
 }
@@ -2985,6 +3102,35 @@ static void registry_handle_remove(void *data, struct wl_registry *reg, uint32_t
 static const struct wl_registry_listener registry_listener = {
     .global = registry_handle_add,
     .global_remove = registry_handle_remove,
+};
+
+/* Wayland listener boilerplate on host display relevant to input forwarding */
+static int timestamp(void)
+{
+    struct timespec tp;
+    clock_gettime(CLOCK_MONOTONIC, &tp);
+    int ms = 1000 * tp.tv_sec + tp.tv_nsec / 1000000;
+    return ms;
+}
+
+static void relative_pointer_relative_motion(void *data,
+        struct zwp_relative_pointer_v1 *zwp_relative_pointer_v1,
+        uint32_t utime_hi, uint32_t utime_lo, wl_fixed_t dx, wl_fixed_t dy,
+        wl_fixed_t dx_unaccel, wl_fixed_t dy_unaccel)
+{
+    struct vo_wayland_seat *s = data;
+    struct vo_wayland_state *wl = s->wl;
+
+    if (!wl->remote_virtual_pointer)
+        return;
+
+    /* FIXME: use arguments as time source */
+    zwlr_virtual_pointer_v1_motion(wl->remote_virtual_pointer, timestamp(), dx, dy);
+    zwlr_virtual_pointer_v1_frame(wl->remote_virtual_pointer);
+}
+
+static const struct zwp_relative_pointer_v1_listener relative_pointer_listener = {
+    relative_pointer_relative_motion,
 };
 
 /* Static functions */
@@ -3557,10 +3703,15 @@ static void remove_seat(struct vo_wayland_seat *seat)
         wl_data_device_destroy(seat->data_device);
     if (seat->text_input)
         zwp_text_input_v3_destroy(seat->text_input->text_input);
+    if (seat->locked_pointer)
+        seat_remove_locked_pointer(seat);
+    if (seat->relative_pointer)
+        seat_remove_relative_pointer(seat);
     if (seat->cursor_shape_device)
         wp_cursor_shape_device_v1_destroy(seat->cursor_shape_device);
     if (seat->xkb_keymap)
         xkb_keymap_unref(seat->xkb_keymap);
+    seat->wl->remote_host_keymap = NULL;
     if (seat->xkb_state)
         xkb_state_unref(seat->xkb_state);
 
@@ -4137,14 +4288,21 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
     if (wl->display_fd == -1)
         return;
 
-    struct pollfd fds[2] = {
-        {.fd = wl->display_fd,     .events = POLLIN },
-        {.fd = wl->wakeup_pipe[0], .events = POLLIN },
+    struct pollfd fds[3] = {
+        {.fd = wl->display_fd,        .events = POLLIN },
+        {.fd = wl->remote_display_fd, .events = POLLIN },
+        {.fd = wl->wakeup_pipe[0],    .events = POLLIN },
     };
 
     while (wl_display_prepare_read(wl->display) != 0)
         wl_display_dispatch_pending(wl->display);
     wl_display_flush(wl->display);
+
+    if (wl->remote_display) {
+        while (wl_display_prepare_read(wl->remote_display) != 0)
+            wl_display_dispatch_pending(wl->remote_display);
+        wl_display_flush(wl->remote_display);
+    }
 
     mp_poll(fds, nfds, timeout_ns);
 
@@ -4160,10 +4318,28 @@ static void wayland_dispatch_events(struct vo_wayland_state *wl, int nfds, int64
         mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
     }
 
-    if (fds[1].revents & POLLIN)
+    if (wl->remote_display) {
+        if (fds[1].revents & POLLIN) {
+            wl_display_read_events(wl->remote_display);
+        } else {
+            wl_display_cancel_read(wl->remote_display);
+        }
+    }
+
+    if (wl->remote_display) {
+        if (fds[1].revents & (POLLERR | POLLHUP | POLLNVAL)) {
+            MP_FATAL(wl, "Error occurred on the remote display fd\n");
+            wl->remote_display_fd = -1;
+            mp_input_put_key(wl->vo->input_ctx, MP_KEY_CLOSE_WIN);
+        }
+    }
+
+    if (fds[2].revents & POLLIN)
         mp_flush_wakeup_pipe(wl->wakeup_pipe[0]);
 
     wl_display_dispatch_pending(wl->display);
+    if (wl->remote_display)
+        wl_display_dispatch_pending(wl->remote_display);
 }
 
 static void xdg_activate(struct vo_wayland_state *wl)
@@ -4174,6 +4350,397 @@ static void xdg_activate(struct vo_wayland_state *wl)
         xdg_activation_v1_activate(wl->xdg_activation, token, wl->surface);
         unsetenv("XDG_ACTIVATION_TOKEN");
     }
+}
+
+/* Static functions for host display relevant to input forwarding */
+static void seat_remove_locked_pointer(struct vo_wayland_seat *s)
+{
+    zwp_locked_pointer_v1_destroy(s->locked_pointer);
+    s->locked_pointer = NULL;
+}
+
+static void seat_remove_relative_pointer(struct vo_wayland_seat *s)
+{
+    zwp_relative_pointer_v1_destroy(s->relative_pointer);
+    s->relative_pointer = NULL;
+}
+
+static void seat_create_locked_pointer(struct vo_wayland_seat *s)
+{
+    if (!s->wl->pointer_constraints || !s->pointer)
+        return;
+
+    s->locked_pointer = zwp_pointer_constraints_v1_lock_pointer(
+            s->wl->pointer_constraints, s->wl->surface, s->pointer, NULL,
+            ZWP_POINTER_CONSTRAINTS_V1_LIFETIME_PERSISTENT);
+}
+
+static void seat_create_relative_pointer(struct vo_wayland_seat *s)
+{
+    if (!s->wl->relative_pointer_manager || !s->pointer)
+        return;
+
+    s->relative_pointer = zwp_relative_pointer_manager_v1_get_relative_pointer(
+            s->wl->relative_pointer_manager, s->pointer);
+    zwp_relative_pointer_v1_add_listener(s->relative_pointer, &relative_pointer_listener, s);
+}
+
+static void toggle_force_grab_cursor(struct vo_wayland_state *wl)
+{
+    struct vo_wayland_seat *s;
+    wl_list_for_each(s, &wl->seat_list, link) {
+        if (!wl->opts->wl_remote_force_grab_cursor ||
+                !wl->opts->wl_remote_input_forwarding) {
+            if (s->locked_pointer)
+                seat_remove_locked_pointer(s);
+            if (s->relative_pointer)
+                seat_remove_relative_pointer(s);
+        }
+
+        if (wl->opts->wl_remote_input_forwarding &&
+                wl->opts->wl_remote_force_grab_cursor) {
+            seat_create_locked_pointer(s);
+            seat_create_relative_pointer(s);
+        }
+    }
+}
+
+static void set_host_mouse_pos(struct vo_wayland_state *wl, struct mpv_node *node)
+{
+    if (node->format != MPV_FORMAT_NODE_MAP)
+        return;
+
+    int32_t mouse_pos_x = 0, mouse_pos_y = 0;
+    mpv_node_list *list = node->u.list;
+    for (int i = 0; i < list->num; i++) {
+        char *key = list->keys[i];
+        mpv_node *value = &list->values[i];
+        if (strcmp(key, "x") == 0)
+            mouse_pos_x = value->u.int64;
+        else if (strcmp(key, "y") == 0)
+            mouse_pos_y = value->u.int64;
+    }
+
+    struct vo_wayland_seat *s;
+    wl_list_for_each(s, &wl->seat_list, link) {
+        if (s->locked_pointer)
+            continue;
+
+        MP_VERBOSE(wl, "Performing pointer warp on seat 0x%x: %d, %d\n", s->id,
+                mouse_pos_x, mouse_pos_y);
+        seat_create_locked_pointer(s);
+        zwp_locked_pointer_v1_set_cursor_position_hint(
+                s->locked_pointer,
+                wl_fixed_from_int(mouse_pos_x),
+                wl_fixed_from_int(mouse_pos_y));
+        /* is this potentially bad to do because of multithreading? */
+        wl_surface_commit(wl->surface);
+        seat_remove_locked_pointer(s);
+    }
+}
+
+/* Remote Wayland listener boilerplate */
+static void remote_output_handle_geometry(void *data,
+                                          struct wl_output *wl_output,
+                                          int32_t x, int32_t y,
+                                          int32_t physical_width,
+                                          int32_t physical_height,
+                                          int32_t subpixel, const char *make,
+                                          const char *model, int32_t transform)
+{
+}
+
+static void remote_output_handle_mode(void *data, struct wl_output *wl_output,
+                                      uint32_t flags, int32_t width,
+                                      int32_t height, int32_t refresh)
+{
+}
+
+static void remote_output_handle_done(void *data, struct wl_output *wl_output)
+{
+    struct vo_wayland_remote_output *remote_o = data;
+    struct vo_wayland_state *wl = remote_o->wl;
+
+    MP_VERBOSE(remote_o->wl, "Registered remote output %s (0x%x)\n",
+               remote_o->name, remote_o->id);
+
+    if (!strcmp(remote_o->name, wl->remote_output_name)) {
+        wl->remote_output = remote_o;
+
+        if (!wl->remote_virtual_pointer && wl->remote_seat &&
+                wl->opts->wl_remote_input_forwarding)
+            remote_create_virtual_pointer(wl);
+    }
+}
+
+static void remote_output_handle_scale(void *data, struct wl_output *wl_output,
+                                       int32_t factor)
+{
+}
+
+static void remote_output_handle_name(void *data, struct wl_output *wl_output,
+                                      const char *name)
+{
+    struct vo_wayland_remote_output *remote_output = data;
+    remote_output->name = talloc_strdup(remote_output->wl, name);
+}
+
+static void remote_output_handle_description(void *data, struct wl_output *wl_output,
+                                             const char *description)
+{
+}
+
+static const struct wl_output_listener remote_output_listener = {
+    remote_output_handle_geometry,
+    remote_output_handle_mode,
+    remote_output_handle_done,
+    remote_output_handle_scale,
+    remote_output_handle_name,
+    remote_output_handle_description,
+};
+
+static void remote_seat_handle_caps(void *data, struct wl_seat *seat,
+                                    enum wl_seat_capability caps)
+{
+}
+
+static void remote_seat_handle_name(void *data, struct wl_seat *seat,
+                                    const char *name)
+{
+    struct vo_wayland_remote_seat *remote_s = data;
+    struct vo_wayland_state *wl = remote_s->wl;
+
+    if (!strcmp(name, wl->remote_seat_name)) {
+        wl->remote_seat = remote_s;
+
+        if (!wl->remote_virtual_keyboard && wl->opts->wl_remote_input_forwarding)
+            remote_create_virtual_keyboard(wl);
+
+        if (!wl->remote_virtual_pointer && wl->remote_output && wl->opts->wl_remote_input_forwarding)
+            remote_create_virtual_pointer(wl);
+    }
+}
+
+static const struct wl_seat_listener remote_seat_listener = {
+    remote_seat_handle_caps,
+    remote_seat_handle_name,
+};
+
+static void remote_registry_handle_add(void *data, struct wl_registry *reg, uint32_t id,
+                                       const char *interface, uint32_t ver)
+{
+    int found = 1;
+    struct vo_wayland_state *wl = data;
+
+    if (!strcmp(interface, wl_output_interface.name) && (ver >= 2) && found++) {
+        struct vo_wayland_remote_output *remote_output = talloc_zero(wl, struct vo_wayland_remote_output);
+
+        remote_output->wl     = wl;
+        remote_output->id     = id;
+        remote_output->name   = "";
+
+        ver = MPMIN(ver, 4); /* Cap at 4 in case new events are added later. */
+        remote_output->output = wl_registry_bind(reg, id, &wl_output_interface, ver);
+        wl_output_add_listener(remote_output->output, &remote_output_listener, remote_output);
+        wl_list_insert(&wl->remote_output_list, &remote_output->link);
+    }
+
+    if (!strcmp(interface, wl_seat_interface.name) && found++) {
+        ver = MPMIN(ver, 8); /* Cap at 8 in case new events are added later. */
+        struct vo_wayland_remote_seat *remote_seat = talloc_zero(wl, struct vo_wayland_remote_seat);
+        remote_seat->wl   = wl;
+        remote_seat->id   = id;
+        remote_seat->seat = wl_registry_bind(reg, id, &wl_seat_interface, ver);
+        wl_seat_add_listener(remote_seat->seat, &remote_seat_listener, remote_seat);
+        wl_list_insert(&wl->remote_seat_list, &remote_seat->link);
+    }
+
+    if (!strcmp(interface, zwp_virtual_keyboard_manager_v1_interface.name) && found++) {
+        ver = 1;
+        wl->remote_virtual_keyboard_manager = wl_registry_bind(reg, id, &zwp_virtual_keyboard_manager_v1_interface, ver);
+    }
+
+    if (!strcmp(interface, zwlr_virtual_pointer_manager_v1_interface.name) && (ver == 2) && found++) {
+        ver = 2;
+        wl->remote_virtual_pointer_manager = wl_registry_bind(reg, id, &zwlr_virtual_pointer_manager_v1_interface, ver);
+    }
+
+    if (found > 1)
+        MP_VERBOSE(wl, "Registered remote interface %s at version %d\n", interface, ver);
+}
+
+static void remote_registry_handle_remove(void *data, struct wl_registry *reg, uint32_t id)
+{
+    struct vo_wayland_state *wl = data;
+
+    struct vo_wayland_remote_output *remote_output, *remote_output_tmp;
+    wl_list_for_each_safe(remote_output, remote_output_tmp, &wl->remote_output_list, link) {
+        if (remote_output->id == id) {
+            remote_remove_output(remote_output);
+            return;
+        }
+    }
+
+    struct vo_wayland_remote_seat *remote_seat, *remote_seat_tmp;
+    wl_list_for_each_safe(remote_seat, remote_seat_tmp, &wl->remote_seat_list, link) {
+        if (remote_seat->id == id) {
+            remote_remove_seat(remote_seat);
+            return;
+        }
+    }
+}
+
+static const struct wl_registry_listener remote_registry_listener = {
+    remote_registry_handle_add,
+    remote_registry_handle_remove,
+};
+
+/* Static functions for remote Wayland display */
+static void remote_toggle_input_forwarding(struct vo_wayland_state *wl)
+{
+    if (!wl->remote_display) {
+        if (wl->opts->wl_remote_input_forwarding)
+            MP_ERR(wl, "Input forwarding cannot be enabled without a remote display configured\n");
+        return;
+    }
+
+    if (!wl->opts->wl_remote_input_forwarding) {
+        if (wl->remote_virtual_keyboard)
+            remote_remove_virtual_keyboard(wl);
+        if (wl->remote_virtual_pointer)
+            remote_remove_virtual_pointer(wl);
+    }
+
+    if (wl->opts->wl_remote_input_forwarding) {
+        if (!wl->remote_virtual_keyboard && wl->remote_seat)
+            remote_create_virtual_keyboard(wl);
+
+        if (!wl->remote_virtual_pointer && wl->remote_seat && wl->remote_output)
+            remote_create_virtual_pointer(wl);
+    }
+}
+
+static void remote_remove_virtual_keyboard(struct vo_wayland_state *wl)
+{
+    MP_VERBOSE(wl, "Deregistering remote virtual keyboard\n");
+    zwp_virtual_keyboard_v1_destroy(wl->remote_virtual_keyboard);
+    wl->remote_virtual_keyboard = NULL;
+    wl->remote_ever_sent_keymap = false;
+}
+
+static void remote_remove_virtual_pointer(struct vo_wayland_state *wl)
+{
+    MP_VERBOSE(wl, "Deregistering remote virtual pointer\n");
+    zwlr_virtual_pointer_v1_destroy(wl->remote_virtual_pointer);
+    wl->remote_virtual_pointer = NULL;
+    wl->remote_frame_button_axis = false;
+}
+
+static void remote_remove_output(struct vo_wayland_remote_output *remote_out)
+{
+    struct vo_wayland_state *wl = remote_out->wl;
+
+    if (remote_out == wl->remote_output) {
+        if (wl->remote_virtual_pointer)
+            remote_remove_virtual_pointer(wl);
+        wl->remote_output = NULL;
+    }
+
+    MP_VERBOSE(remote_out->wl, "Deregistering remote output 0x%x\n", remote_out->id);
+    wl_list_remove(&remote_out->link);
+    wl_output_destroy(remote_out->output);
+    talloc_free(remote_out);
+    return;
+}
+
+static void remote_remove_seat(struct vo_wayland_remote_seat *remote_seat)
+{
+    struct vo_wayland_state *wl = remote_seat->wl;
+
+    if (remote_seat == wl->remote_seat) {
+        if (wl->remote_virtual_keyboard)
+            remote_remove_virtual_keyboard(wl);
+        if (wl->remote_virtual_pointer)
+            remote_remove_virtual_pointer(wl);
+        wl->remote_seat = NULL;
+    }
+
+    MP_VERBOSE(remote_seat->wl, "Deregistering remote seat 0x%x\n", remote_seat->id);
+    wl_list_remove(&remote_seat->link);
+    wl_seat_destroy(remote_seat->seat);
+    talloc_free(remote_seat);
+    return;
+}
+
+static void remote_sync_keymap(struct vo_wayland_state *wl)
+{
+    if (!wl->remote_virtual_keyboard || !wl->remote_host_keymap)
+        return;
+
+    char *keymap_string = xkb_keymap_get_as_string(wl->remote_host_keymap,
+            XKB_KEYMAP_FORMAT_TEXT_V1);
+
+    if (!keymap_string)
+        return;
+
+    size_t keymap_size = strlen(keymap_string) + 1;
+
+    int keymap_fd = memfd_create("mpv", 0);
+    if (keymap_fd < 0) {
+        free(keymap_string);
+        return;
+    }
+
+    int ret;
+    do {
+        ret = ftruncate(keymap_fd, keymap_size);
+    } while (ret < 0 && errno == EINTR);
+
+    if (ret < 0) {
+        close(keymap_fd);
+        free(keymap_string);
+        return;
+    }
+
+    size_t written = 0;
+    while (written < keymap_size) {
+        ssize_t ssize_ret = write(keymap_fd, keymap_string + written, keymap_size - written);
+        if (ssize_ret == -1 && errno == EINTR)
+            continue;
+        if (ssize_ret == -1) {
+            close(keymap_fd);
+            free(keymap_string);
+            return;
+        }
+        written += ssize_ret;
+    }
+
+    free(keymap_string);
+
+    zwp_virtual_keyboard_v1_keymap(wl->remote_virtual_keyboard,
+            WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1,
+            keymap_fd, keymap_size);
+
+    wl->remote_ever_sent_keymap = true;
+}
+
+static void remote_create_virtual_keyboard(struct vo_wayland_state *wl)
+{
+    MP_VERBOSE(wl, "Registering remote virtual keyboard\n");
+    wl->remote_virtual_keyboard =
+        zwp_virtual_keyboard_manager_v1_create_virtual_keyboard(
+                wl->remote_virtual_keyboard_manager, wl->remote_seat->seat);
+
+    remote_sync_keymap(wl);
+}
+
+static void remote_create_virtual_pointer(struct vo_wayland_state *wl)
+{
+    MP_VERBOSE(wl, "Registering remote virtual pointer\n");
+    wl->remote_virtual_pointer =
+        zwlr_virtual_pointer_manager_v1_create_virtual_pointer_with_output(
+                wl->remote_virtual_pointer_manager,
+                wl->remote_seat->seat, wl->remote_output->output);
 }
 
 /* Non-static */
@@ -4222,7 +4789,7 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
 
     switch (request) {
     case VOCTRL_CHECK_EVENTS: {
-        wayland_dispatch_events(wl, 1, 0);
+        wayland_dispatch_events(wl, 2, 0);
         struct vo_wayland_seat *seat;
         wl_list_for_each(seat, &wl->seat_list, link) {
             check_fd(wl, seat->dnd_offer, true);
@@ -4280,6 +4847,12 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
             {
                 set_geometry(wl, true);
             }
+            if (opt == &opts->wl_remote_input_forwarding) {
+                remote_toggle_input_forwarding(wl);
+                toggle_force_grab_cursor(wl);
+            }
+            if (opt == &opts->wl_remote_force_grab_cursor)
+                toggle_force_grab_cursor(wl);
         }
         return VO_TRUE;
     }
@@ -4402,6 +4975,9 @@ int vo_wayland_control(struct vo *vo, int *events, int request, void *arg)
         }
         return VO_TRUE;
     }
+    case VOCTRL_SET_MOUSE_POS:
+        set_host_mouse_pos(wl, (struct mpv_node *)arg);
+        return VO_TRUE;
     }
 
     return VO_NOTIMPL;
@@ -4502,18 +5078,41 @@ bool vo_wayland_init(struct vo *vo)
         .cursor_visible = true,
         .opts_cache = m_config_cache_alloc(wl, vo->global, &vo_sub_opts),
         .preferred_csp = pl_color_space_srgb,
+        .remote_display_fd = -1,
     };
     wl->opts = wl->opts_cache->opts;
+
+    wl->remote_display_name = talloc_strdup(wl, wl->opts->wl_remote_display_name),
+    wl->remote_output_name = talloc_strdup(wl, wl->opts->wl_remote_output_name),
+    wl->remote_seat_name = talloc_strdup(wl, wl->opts->wl_remote_seat_name),
 
     wl_list_init(&wl->output_list);
     wl_list_init(&wl->seat_list);
     wl_list_init(&wl->tranche_list);
+
+    wl_list_init(&wl->remote_output_list);
+    wl_list_init(&wl->remote_seat_list);
 
     wl->display = wl_display_connect(NULL);
     if (!wl->display) {
         MP_MSG(wl, vo->probing ? MSGL_V : MSGL_FATAL,
                "Couldn't connect to Wayland display: %s\n", strerror(errno));
         goto err;
+    }
+
+    if (wl->remote_display_name) {
+        if (!wl->remote_output_name || !wl->remote_seat_name) {
+            MP_FATAL(wl, "Missing --wayland-remote-output-name and/or --wayland-remote-seat-name\n");
+            goto err;
+        }
+
+        wl->remote_display = wl_display_connect(wl->remote_display_name);
+
+        if (!wl->remote_display) {
+            MP_FATAL(wl, "Couldn't connect to remote Wayland display at %s: %s\n",
+                    wl->remote_display_name, strerror(errno));
+            goto err;
+        }
     }
 
     if (create_input(wl))
@@ -4527,8 +5126,15 @@ bool vo_wayland_init(struct vo *vo)
     wl->registry = wl_display_get_registry(wl->display);
     wl_registry_add_listener(wl->registry, &registry_listener, wl);
 
+    if (wl->remote_display) {
+        wl->remote_registry = wl_display_get_registry(wl->remote_display);
+        wl_registry_add_listener(wl->remote_registry, &remote_registry_listener, wl);
+    }
+
     /* Do a roundtrip to run the registry */
     wl_display_roundtrip(wl->display);
+    if (wl->remote_display)
+        wl_display_roundtrip(wl->remote_display);
 
     if (!wl->surface) {
         MP_FATAL(wl, "Compositor doesn't support %s (ver. 4)\n",
@@ -4685,7 +5291,31 @@ bool vo_wayland_init(struct vo *vo)
                     zwp_tablet_manager_v2_interface.name);
     }
 
+    if (!wl->pointer_constraints) {
+        MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
+                zwp_pointer_constraints_v1_interface.name);
+    }
+
+    if (!wl->relative_pointer_manager) {
+        MP_VERBOSE(wl, "Compositor doesn't support the %s protocol!\n",
+                zwp_relative_pointer_manager_v1_interface.name);
+    }
+
+    if (wl->remote_display && !wl->remote_virtual_keyboard_manager) {
+        MP_FATAL(wl, "Remote compositor doesn't support the required %s protocol!\n",
+                 zwp_virtual_keyboard_manager_v1_interface.name);
+        goto err;
+    }
+
+    if (wl->remote_display && !wl->remote_virtual_pointer_manager) {
+        MP_FATAL(wl, "Remote compositor doesn't support the required %s protocol!\n",
+                 zwlr_virtual_pointer_manager_v1_interface.name);
+        goto err;
+    }
+
     wl->display_fd = wl_display_get_fd(wl->display);
+    if (wl->remote_display)
+        wl->remote_display_fd = wl_display_get_fd(wl->remote_display);
 
     update_app_id(wl);
     mp_make_wakeup_pipe(wl->wakeup_pipe);
@@ -4939,6 +5569,26 @@ void vo_wayland_uninit(struct vo *vo)
 
     munmap(wl->compositor_format_map, wl->compositor_format_size);
 
+    if (wl->remote_virtual_keyboard_manager)
+        zwp_virtual_keyboard_manager_v1_destroy(wl->remote_virtual_keyboard_manager);
+
+    if (wl->remote_virtual_pointer_manager)
+        zwlr_virtual_pointer_manager_v1_destroy(wl->remote_virtual_pointer_manager);
+
+    struct vo_wayland_remote_output *remote_output, *remote_output_tmp;
+    wl_list_for_each_safe(remote_output, remote_output_tmp, &wl->remote_output_list, link)
+        remote_remove_output(remote_output);
+
+    struct vo_wayland_remote_seat *remote_seat, *remote_seat_tmp;
+    wl_list_for_each_safe(remote_seat, remote_seat_tmp, &wl->remote_seat_list, link)
+        remote_remove_seat(remote_seat);
+
+    if (wl->remote_registry)
+        wl_registry_destroy(wl->remote_registry);
+
+    if (wl->remote_display)
+        wl_display_disconnect(wl->remote_display);
+
     for (int n = 0; n < 2; n++)
         close(wl->wakeup_pipe[n]);
     talloc_free(wl);
@@ -4977,7 +5627,7 @@ void vo_wayland_wait_frame(struct vo_wayland_state *wl)
         if (poll_time < 0) {
             poll_time = 0;
         }
-        wayland_dispatch_events(wl, 1, poll_time);
+        wayland_dispatch_events(wl, 2, poll_time);
     }
 
     /* If the compositor does not have presentation time, we cannot be sure
@@ -5007,7 +5657,7 @@ void vo_wayland_wait_events(struct vo *vo, int64_t until_time_ns)
     int64_t wait_ns = until_time_ns - mp_time_ns();
     int64_t timeout_ns = MPCLAMP(wait_ns, 0, MP_TIME_S_TO_NS(10));
 
-    wayland_dispatch_events(wl, 2, timeout_ns);
+    wayland_dispatch_events(wl, 3, timeout_ns);
 }
 
 void vo_wayland_wakeup(struct vo *vo)

@@ -12,8 +12,11 @@ protocols = [[wl_protocol_dir, 'stable/linux-dmabuf/linux-dmabuf-v1.xml'],
              [wl_protocol_dir, 'staging/xdg-activation/xdg-activation-v1.xml'],
              [wl_protocol_dir, 'unstable/tablet/tablet-unstable-v2.xml'],
              [wl_protocol_dir, 'staging/cursor-shape/cursor-shape-v1.xml'],
-             [wl_protocol_dir, 'staging/fifo/fifo-v1.xml']
-]
+             [wl_protocol_dir, 'staging/fifo/fifo-v1.xml'],
+             ['protocols', 'virtual-keyboard-unstable-v1.xml'],
+             ['protocols', 'wlr-virtual-pointer-unstable-v1.xml'],
+             [wl_protocol_dir, 'unstable/relative-pointer/relative-pointer-unstable-v1.xml'],
+             [wl_protocol_dir, 'unstable/pointer-constraints/pointer-constraints-unstable-v1.xml']]
 wl_protocols_source = []
 wl_protocols_headers = []
 

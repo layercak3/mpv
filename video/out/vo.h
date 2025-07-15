@@ -133,6 +133,9 @@ enum mp_voctrl {
     // Clipboard
     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
     VOCTRL_SET_CLIPBOARD,
+
+    // Input forwarding, set host cursor position
+    VOCTRL_SET_MOUSE_POS,               // struct mpv_node*
 };
 
 // Helper to expose what kind of content is currently playing to the VO.
